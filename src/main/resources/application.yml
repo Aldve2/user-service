@@ -1,6 +1,6 @@
 spring:
   application:
-    name: person-service
+    name: user-service
   neo4j:
     uri: ${NEO4J_URI}
     authentication:
