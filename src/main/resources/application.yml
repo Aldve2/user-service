@@ -8,4 +8,4 @@ spring:
       password: ${NEO4J_PASSWORD}
 server:
   address: '0.0.0.0'
-  port: 10011
+  port: 10021
