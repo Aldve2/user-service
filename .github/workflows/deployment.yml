@@ -1,0 +1,139 @@
+name: Deploy to ECS with Neo4j Configuration
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: crm-cluster
+  ECS_SERVICE: user-service
+  ECS_TASK_DEFINITION: user-task
+  CONTAINER_NAME: user-service
+  DOCKER_IMAGE: aledve/user-service
+  DOCKER_TAG: latest
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Verify AWS credentials
+        id: verify-aws
+        run: |
+          echo "Verifying AWS credentials..."
+          if ! aws sts get-caller-identity; then
+            echo "::error::Invalid or expired AWS credentials"
+            exit 1
+          fi
+          echo "✓ AWS credentials valid"
+      - name: Login to Docker Hub
+        if: steps.verify-aws.outcome == 'success'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.verify-aws.outcome == 'success'
+        id: docker-build
+        run: |
+          docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} .
+          docker push ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          echo "IMAGE_NAME=${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}" >> $GITHUB_ENV
+      - name: Get current task definition
+        if: steps.verify-aws.outcome == 'success'
+        id: get-task-def
+        run: |
+          echo "Getting current task definition..."
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --query 'taskDefinition' > task-definition.json
+          echo "✓ Task definition retrieved"
+      - name: Update task definition with Neo4j configuration
+        if: steps.verify-aws.outcome == 'success'
+        id: update-task-def
+        run: |
+          echo "Updating task definition with Neo4j configuration..."
+          jq --arg IMAGE "${{ env.IMAGE_NAME }}" \
+             --arg NAME "${{ env.CONTAINER_NAME }}" \
+             --arg NEO4J_IP "${{ secrets.NEO4J_IP }}" \
+             --arg NEO4J_USERNAME "${{ secrets.NEO4J_USERNAME }}" \
+             --arg NEO4J_PASSWORD "${{ secrets.NEO4J_PASSWORD }}" \
+             'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy) |
+             .containerDefinitions |= map(
+               if .name == $NAME then 
+                 .image = $IMAGE |
+                 .environment += [
+                   {
+                     "name": "NEO4J_URI",
+                     "value": ("bolt://" + $NEO4J_IP + ":7687")
+                   },
+                   {
+                     "name": "NEO4J_USERNAME",
+                     "value": $NEO4J_USERNAME
+                   },
+                   {
+                     "name": "NEO4J_PASSWORD",
+                     "value": $NEO4J_PASSWORD
+                   }
+                 ]
+               else . end
+             ) |
+             if .executionRoleArn == null then del(.executionRoleArn) else . end' \
+             task-definition.json > updated-task-definition.json
+          echo "✓ Task definition updated with Neo4j configuration"
+      - name: Register new task definition
+        if: steps.verify-aws.outcome == 'success'
+        id: register-task-def
+        run: |
+          echo "Registering new task definition..."
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://updated-task-definition.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "NEW_TASK_ARN=$NEW_TASK_ARN" >> $GITHUB_ENV
+          echo "✓ New task definition registered: $NEW_TASK_ARN"
+      - name: Update ECS service
+        if: steps.verify-aws.outcome == 'success'
+        id: update-service
+        run: |
+          echo "Updating ECS service..."
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ env.NEW_TASK_ARN }} \
+            --force-new-deployment
+          echo "✓ Service update initiated"
+      - name: Wait for deployment
+        if: steps.verify-aws.outcome == 'success'
+        id: wait-for-deployment
+        run: |
+          echo "Waiting for service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
+          echo "✓ Deployment completed successfully"
+      - name: Verify deployment
+        if: steps.verify-aws.outcome == 'success'
+        run: |
+          echo "Verifying deployment..."
+          SERVICE_STATUS=$(aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --query 'services[0].events[0].message' \
+            --output text)
+          echo "Latest service event: $SERVICE_STATUS"
