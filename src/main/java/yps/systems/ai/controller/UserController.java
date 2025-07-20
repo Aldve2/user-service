@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Optional;
 
 @RestController
-@RequestMapping("/command/userService")
+@RequestMapping("/userService")
 public class UserController {
 
     private final IUserRepository userRepository;
